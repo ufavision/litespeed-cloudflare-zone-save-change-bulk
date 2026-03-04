@@ -7,24 +7,13 @@
 #    try_refresh_zone() ไม่ commit ลง DB ใน wp eval CLI context
 #    เพราะ LiteSpeed Conf->update() รอ WordPress shutdown hook
 #    → แก้โดยยิง Cloudflare API เอง + update_option() โดยตรง
-#
-#  Option format ใน DB (แยก row):
-#    litespeed.conf.cdn-cloudflare        = 1/0
-#    litespeed.conf.cdn-cloudflare_key    = API Key / API Token
-#    litespeed.conf.cdn-cloudflare_email  = email
-#    litespeed.conf.cdn-cloudflare_name   = domain
-#    litespeed.conf.cdn-cloudflare_zone   = Zone ID
-#    litespeed.conf.cdn-cloudflare_clear  = purge on LSCache purge all
 # =============================================================
 
 # ─── ตั้งค่า ─────────────────────────────────────────────────
-DELAY_SECONDS=2      # หน่วง (วินาที) ระหว่างเว็บ (ป้องกัน CF rate limit)
-WP_TIMEOUT=30        # timeout ต่อเว็บ
-MAX_RETRY=3          # retry สูงสุดต่อเว็บ (กรณี CF ไม่ตอบ)
-RETRY_DELAY=5        # รอ (วินาที) ก่อน retry
-# ─────────────────────────────────────────────────────────────
-# หมายเหตุ: รัน Sequential (ไม่ parallel)
-# เพราะหลายเว็บอาจใช้ CF account เดียวกัน → parallel = rate limit
+MAX_JOBS=5       # parallel jobs (แนะนำ 5 — ปลอดภัยสำหรับหลาย CF account)
+WP_TIMEOUT=30    # timeout ต่อเว็บ (วินาที)
+MAX_RETRY=3      # retry สูงสุดต่อเว็บ (กรณี CF ไม่ตอบ)
+RETRY_DELAY=5    # รอ (วินาที) ก่อน retry
 # ─────────────────────────────────────────────────────────────
 
 LOG_FILE="/var/log/lscwp-cf-save.log"
@@ -32,6 +21,8 @@ LOG_PASS="/var/log/lscwp-cf-save-pass.log"
 LOG_FAIL="/var/log/lscwp-cf-save-fail.log"
 LOG_SKIP="/var/log/lscwp-cf-save-skip.log"
 LOCK_FILE="${LOG_FILE}.lock"
+RESULT_DIR="/tmp/lscwp-cf-$$"
+mkdir -p "$RESULT_DIR"
 
 log() {
     local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
@@ -42,13 +33,17 @@ log() {
 log_result() {
     local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
     case "$1" in
-        pass) echo "[$ts] $2" >> "$LOG_PASS" ;;
-        fail) echo "[$ts] $2" >> "$LOG_FAIL" ;;
-        skip) echo "[$ts] $2" >> "$LOG_SKIP" ;;
+        pass) ( flock 201; echo "[$ts] $2" >> "$LOG_PASS" ) 201>"${LOG_FILE}.pass.lock" ;;
+        fail) ( flock 202; echo "[$ts] $2" >> "$LOG_FAIL" ) 202>"${LOG_FILE}.fail.lock" ;;
+        skip) ( flock 203; echo "[$ts] $2" >> "$LOG_SKIP" ) 203>"${LOG_FILE}.skip.lock" ;;
     esac
 }
 
-cleanup() { rm -f "$LOCK_FILE"; }
+cleanup() {
+    wait
+    rm -rf "$RESULT_DIR"
+    rm -f "$LOCK_FILE" "${LOG_FILE}.pass.lock" "${LOG_FILE}.fail.lock" "${LOG_FILE}.skip.lock"
+}
 trap cleanup EXIT
 
 # ─── ตรวจ WP-CLI ─────────────────────────────────────────────
@@ -61,7 +56,7 @@ START_TIME=$(date +%s)
 log "======================================"
 log " BULK CF SAVE CHANGES (LiteSpeed CDN)"
 log " เริ่มเวลา   : $(date '+%Y-%m-%d %H:%M:%S')"
-log " Delay       : ${DELAY_SECONDS}s | Retry: ${MAX_RETRY}x | RetryDelay: ${RETRY_DELAY}s"
+log " Jobs        : $MAX_JOBS | Retry: ${MAX_RETRY}x | RetryDelay: ${RETRY_DELAY}s"
 log "======================================"
 
 # ─── ค้นหา WordPress ทุกเว็บ ─────────────────────────────────
@@ -78,7 +73,7 @@ if [[ -f /etc/trueuserdomains ]]; then
         while IFS= read -r -d '' _wpc; do
             _d="$(dirname "$_wpc")/"
             [[ -z "${_SEEN[$_d]+_}" ]] && { _SEEN[$_d]=1; DIRS+=("$_d"); }
-        done < <(find "$_uhome" -maxdepth 4 -name "wp-config.php" -print0 2>/dev/null)
+        done < <(find "$_uhome" -maxdepth 5 -name "wp-config.php" -print0 2>/dev/null)
     done < /etc/trueuserdomains
 fi
 
@@ -95,19 +90,37 @@ TOTAL=${#DIRS[@]}
 log "พบ WordPress : $TOTAL เว็บ"
 log "======================================"
 
-COUNT=0; SUCCESS=0; FAILED=0; SKIPPED=0
-
-for dir in "${DIRS[@]}"; do
-    COUNT=$(( COUNT + 1 ))
+# ─── ฟังก์ชัน process แต่ละเว็บ (รัน parallel) ───────────────
+process_site() {
+    local dir="$1"
+    local COUNT="$2"
+    local TOTAL="$3"
+    local SITE UNIQ
     SITE=$(echo "$dir" | sed 's|/home[0-9]*/||;s|/$||')
-    LABEL="[$COUNT/$TOTAL] $SITE"
+    UNIQ="${BASHPID}_$(date +%s%N)"
+    local LABEL="[$COUNT/$TOTAL] $SITE"
 
-    # ── WP bootstrap 1 ครั้ง: check + ยิง CF API + save ──────
+    _log() {
+        local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+        echo "$1"
+        ( flock 200; echo "[$ts] $1" >> "$LOG_FILE" ) 200>"$LOCK_FILE"
+    }
+    _log_r() {
+        local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+        case "$1" in
+            pass) ( flock 201; echo "[$ts] $2" >> "$LOG_PASS" ) 201>"${LOG_FILE}.pass.lock" ;;
+            fail) ( flock 202; echo "[$ts] $2" >> "$LOG_FAIL" ) 202>"${LOG_FILE}.fail.lock" ;;
+            skip) ( flock 203; echo "[$ts] $2" >> "$LOG_SKIP" ) 203>"${LOG_FILE}.skip.lock" ;;
+        esac
+    }
+
+    local MR="$MAX_RETRY"
+    local RD="$RETRY_DELAY"
+
     EVAL_OUT=$(timeout "$WP_TIMEOUT" wp --path="$dir" eval '
         // ── 1. Plugin active? ────────────────────────────────
         if (!is_plugin_active("litespeed-cache/litespeed-cache.php")) {
-            echo "STATUS:NOPLUGIN";
-            return;
+            echo "STATUS:NOPLUGIN"; return;
         }
 
         // ── 2. อ่าน options + ตรวจ ───────────────────────────
@@ -117,24 +130,20 @@ for dir in "${DIRS[@]}"; do
         $name    = trim((string) get_option("litespeed.conf.cdn-cloudflare_name",  ""));
 
         if (!$enabled || $enabled === "0" || $enabled === false) {
-            echo "STATUS:CF_OFF";
-            return;
+            echo "STATUS:CF_OFF"; return;
         }
         if (!$key || !$name) {
-            printf("STATUS:NO_CRED\tKEY_LEN:%d\tNAME:%s", strlen($key), $name);
-            return;
+            printf("STATUS:NO_CRED\tKEY_LEN:%d\tNAME:%s", strlen($key), $name); return;
         }
 
         // ── 3. ยิง CF API โดยตรง + retry ─────────────────────
-        // (fix: LiteSpeed Conf->update() ไม่ commit ใน CLI context)
-        $max_retry   = '"$MAX_RETRY"';
-        $retry_delay = '"$RETRY_DELAY"';
+        $max_retry   = '"$MR"';
+        $retry_delay = '"$RD"';
         $zone_id     = "";
         $zone_name   = "";
         $attempt     = 0;
         $cf_error    = "";
 
-        // รองรับทั้ง Global API Key (email+key) และ API Token (key เท่านั้น)
         $is_token = (strlen($key) > 37 && strpos($email, "@") === false);
         $headers  = $is_token
             ? ["Authorization: Bearer $key", "Content-Type: application/json"]
@@ -155,27 +164,24 @@ for dir in "${DIRS[@]}"; do
             curl_close($ch);
 
             if ($curl_err) {
-                $cf_error = "curl_error:" . $curl_err;
+                $cf_error = "curl:" . $curl_err;
                 if ($attempt < $max_retry) { sleep($retry_delay); continue; }
                 break;
             }
-
             $res = json_decode($raw, true);
             if ($http !== 200 || empty($res["success"])) {
                 $cf_error = "http:" . $http . " err:" . json_encode($res["errors"] ?? []);
                 if ($attempt < $max_retry) { sleep($retry_delay); continue; }
                 break;
             }
-
             $zone_id   = $res["result"][0]["id"]   ?? "";
             $zone_name = $res["result"][0]["name"] ?? $name;
             if ($zone_id) break;
-
-            $cf_error = "zone_empty_in_response";
+            $cf_error = "zone_empty";
             if ($attempt < $max_retry) sleep($retry_delay);
         }
 
-        // ── 4. บันทึกลง DB โดยตรง (ข้าม LiteSpeed Conf cache) ─
+        // ── 4. บันทึกลง DB โดยตรง ────────────────────────────
         if ($zone_id) {
             update_option("litespeed.conf.cdn-cloudflare_zone", $zone_id);
             update_option("litespeed.conf.cdn-cloudflare_name", $zone_name);
@@ -188,28 +194,30 @@ for dir in "${DIRS[@]}"; do
         );
     ' --allow-root 2>/dev/null)
 
-    # ── parse output ─────────────────────────────────────────
-    STATUS=$(  echo "$EVAL_OUT" | grep -oP '(?<=STATUS:)\w+')
+    local STATUS
+    STATUS=$(echo "$EVAL_OUT" | grep -oP '(?<=STATUS:)\w+')
 
     case "$STATUS" in
         NOPLUGIN)
-            log "⏭  SKIP (plugin ไม่ active): $LABEL"
-            log_result skip "$SITE | plugin ไม่ active"
-            SKIPPED=$(( SKIPPED + 1 ))
+            _log  "⏭  SKIP (plugin ไม่ active): $LABEL"
+            _log_r skip "$SITE | plugin ไม่ active"
+            touch "${RESULT_DIR}/skip_${UNIQ}"
             ;;
         CF_OFF)
-            log "⏭  SKIP (Cloudflare ปิดอยู่): $LABEL"
-            log_result skip "$SITE | cdn-cloudflare=OFF"
-            SKIPPED=$(( SKIPPED + 1 ))
+            _log  "⏭  SKIP (Cloudflare ปิดอยู่): $LABEL"
+            _log_r skip "$SITE | cdn-cloudflare=OFF"
+            touch "${RESULT_DIR}/skip_${UNIQ}"
             ;;
         NO_CRED)
+            local KL NM
             KL=$(echo "$EVAL_OUT" | grep -oP '(?<=KEY_LEN:)\d+')
             NM=$(echo "$EVAL_OUT" | grep -oP '(?<=NAME:)[^\t]*')
-            log "⏭  SKIP (ไม่มี API Key/Domain): $LABEL | name='$NM' key_len=$KL"
-            log_result skip "$SITE | ไม่มี API Key หรือ Domain | name='$NM' key_len=$KL"
-            SKIPPED=$(( SKIPPED + 1 ))
+            _log  "⏭  SKIP (ไม่มี API Key/Domain): $LABEL | name='$NM' key_len=$KL"
+            _log_r skip "$SITE | ไม่มี API Key หรือ Domain | name='$NM' key_len=$KL"
+            touch "${RESULT_DIR}/skip_${UNIQ}"
             ;;
         DONE)
+            local ZONE DOMAIN EMAIL KPFX ATTEMPT CFERROR
             ZONE=$(    echo "$EVAL_OUT" | grep -oP '(?<=ZONE:)[^\t]*')
             DOMAIN=$(  echo "$EVAL_OUT" | grep -oP '(?<=DOMAIN:)[^\t]*')
             EMAIL=$(   echo "$EVAL_OUT" | grep -oP '(?<=EMAIL:)[^\t]*')
@@ -218,27 +226,46 @@ for dir in "${DIRS[@]}"; do
             CFERROR=$( echo "$EVAL_OUT" | grep -oP '(?<=ERROR:)[^\t]*')
 
             if [[ -n "$ZONE" ]]; then
-                log "✅ PASS: $LABEL | domain=$DOMAIN | zone=$ZONE | attempt=${ATTEMPT}/${MAX_RETRY}"
-                log_result pass "$SITE | domain=$DOMAIN | zone=$ZONE | email=$EMAIL | key=${KPFX}... | attempt=${ATTEMPT}/${MAX_RETRY}"
-                SUCCESS=$(( SUCCESS + 1 ))
+                _log  "✅ PASS: $LABEL | domain=$DOMAIN | zone=$ZONE | attempt=${ATTEMPT}/${MAX_RETRY}"
+                _log_r pass "$SITE | domain=$DOMAIN | zone=$ZONE | email=$EMAIL | key=${KPFX}... | attempt=${ATTEMPT}/${MAX_RETRY}"
+                touch "${RESULT_DIR}/pass_${UNIQ}"
             else
-                log "❌ FAIL: $LABEL | domain=$DOMAIN | attempt=${ATTEMPT}/${MAX_RETRY} | error=$CFERROR"
-                log_result fail "$SITE | zone=(empty) | domain=$DOMAIN | email=$EMAIL | key=${KPFX}... | attempt=${ATTEMPT}/${MAX_RETRY} | error=$CFERROR"
-                FAILED=$(( FAILED + 1 ))
+                _log  "❌ FAIL: $LABEL | domain=$DOMAIN | attempt=${ATTEMPT}/${MAX_RETRY} | error=$CFERROR"
+                _log_r fail "$SITE | zone=(empty) | domain=$DOMAIN | email=$EMAIL | key=${KPFX}... | attempt=${ATTEMPT}/${MAX_RETRY} | error=$CFERROR"
+                touch "${RESULT_DIR}/fail_${UNIQ}"
             fi
-            sleep "$DELAY_SECONDS"
             ;;
         *)
-            log "❌ FAIL (wp error/timeout): $LABEL"
-            log_result fail "$SITE | wp eval ล้มเหลว | ${EVAL_OUT:0:120}"
-            FAILED=$(( FAILED + 1 ))
+            _log  "❌ FAIL (wp error/timeout): $LABEL"
+            _log_r fail "$SITE | wp eval ล้มเหลว | ${EVAL_OUT:0:120}"
+            touch "${RESULT_DIR}/fail_${UNIQ}"
             ;;
     esac
+}
+
+export -f process_site
+export LOG_FILE LOCK_FILE LOG_PASS LOG_FAIL LOG_SKIP RESULT_DIR WP_TIMEOUT MAX_RETRY RETRY_DELAY
+
+# ─── รัน parallel ────────────────────────────────────────────
+declare -a PIDS=()
+COUNT=0
+for dir in "${DIRS[@]}"; do
+    COUNT=$(( COUNT + 1 ))
+    process_site "$dir" "$COUNT" "$TOTAL" &
+    PIDS+=($!)
+    if (( ${#PIDS[@]} >= MAX_JOBS )); then
+        wait "${PIDS[0]}"
+        PIDS=("${PIDS[@]:1}")
+    fi
 done
+for pid in "${PIDS[@]}"; do wait "$pid"; done
 
 # ─── สรุป ────────────────────────────────────────────────────
 END_TIME=$(date +%s)
 ELAPSED=$(( END_TIME - START_TIME ))
+SUCCESS=$(find "$RESULT_DIR" -name "pass_*" 2>/dev/null | wc -l)
+FAILED=$( find "$RESULT_DIR" -name "fail_*" 2>/dev/null | wc -l)
+SKIPPED=$(find "$RESULT_DIR" -name "skip_*" 2>/dev/null | wc -l)
 
 log "======================================"
 log " สรุปผลรวม"
