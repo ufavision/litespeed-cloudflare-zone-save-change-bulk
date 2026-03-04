@@ -127,8 +127,8 @@ for dir in "${DIRS[@]}"; do
 
         // ── 3. ยิง CF API โดยตรง + retry ─────────────────────
         // (fix: LiteSpeed Conf->update() ไม่ commit ใน CLI context)
-        $max_retry   = (int) getenv("MAX_RETRY")   ?: 3;
-        $retry_delay = (int) getenv("RETRY_DELAY") ?: 5;
+        $max_retry   = '"$MAX_RETRY"';
+        $retry_delay = '"$RETRY_DELAY"';
         $zone_id     = "";
         $zone_name   = "";
         $attempt     = 0;
@@ -186,8 +186,7 @@ for dir in "${DIRS[@]}"; do
         printf("STATUS:DONE\tZONE:%s\tDOMAIN:%s\tEMAIL:%s\tKEY:%s\tATTEMPT:%d\tERROR:%s",
             $verify, $zone_name ?: $name, $email, substr($key,0,8), $attempt, $cf_error
         );
-    ' --allow-root 2>/dev/null \
-      MAX_RETRY="$MAX_RETRY" RETRY_DELAY="$RETRY_DELAY")
+    ' --allow-root 2>/dev/null)
 
     # ── parse output ─────────────────────────────────────────
     STATUS=$(  echo "$EVAL_OUT" | grep -oP '(?<=STATUS:)\w+')
