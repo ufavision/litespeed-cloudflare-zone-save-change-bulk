@@ -8,7 +8,7 @@
 ## คำสั่งในการรัน
 
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/ufavision/litespeed-cloudflare-zone-save-change/main/cloudflare-zone-save-change.sh)
+bash <(curl -s https://raw.githubusercontent.com/AnonymousVS/litespeed-cloudflare-zone-save-change/main/cloudflare-zone-save-change.sh)
 ```
 ---
 
